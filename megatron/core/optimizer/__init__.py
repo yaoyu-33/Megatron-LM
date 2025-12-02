@@ -284,6 +284,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     data_parallel_group_idx: Optional[int] = None,
     intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
     distributed_optimizer_instance_id: Optional[int] = 0,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> MegatronOptimizer:
     """Get Megatron optimizer based on parameter groups.
 
@@ -470,6 +471,13 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
+    if pg_collection is None or not hasattr(pg_collection, 'tp'):
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+    else:
+        tp_group = pg_collection.tp
+    # TODO(M4): plumb tp_group through optimizer constructors so this setattr disappears.
+    setattr(optimizer, 'tp_group', tp_group)
+
     return optimizer
 
 
@@ -573,24 +581,15 @@ def get_megatron_optimizer(
                     data_parallel_group_idx=model_parallel_rank,
                     intra_dist_opt_group=intra_dist_opt_group,
                     distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                    pg_collection=pg_collection,
                 )
             )
             model_chunk_offset += 1
 
-        # Build final optimizer (single or chained)
-        result_optimizer = optimizers[0] if len(optimizers) == 1 else ChainedOptimizer(optimizers)
+        if len(optimizers) == 1:
+            return optimizers[0]
 
-        tp_group = (
-            pg_collection.tp
-            if pg_collection is not None
-            else parallel_state.get_tensor_model_parallel_group()
-        )
-        if isinstance(result_optimizer, ChainedOptimizer):
-            for opt in result_optimizer.chained_optimizers:
-                setattr(opt, 'tp_group', tp_group)
-        else:
-            setattr(result_optimizer, 'tp_group', tp_group)
-        return result_optimizer
+        return ChainedOptimizer(optimizers)
 
     if dump_param_to_param_group_map is not None:
         param_to_param_group = {}
@@ -633,6 +632,7 @@ def get_megatron_optimizer(
                 data_parallel_group_idx=model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                pg_collection=pg_collection,
             )
         )
         model_chunk_offset += 1
@@ -673,6 +673,7 @@ def get_megatron_optimizer(
                 data_parallel_group_idx=expt_model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                pg_collection=pg_collection,
             )
         )
 
@@ -681,14 +682,4 @@ def get_megatron_optimizer(
             state_dict=param_to_param_group, checkpoint_id=dump_param_to_param_group_map
         )
 
-    # Build final optimizer (always chained in this branch, possibly with 1 element)
-    result_optimizer = ChainedOptimizer(optimizers)
-    # Attach TP group so duplicate-checks don't rely on legacy globals.
-    tp_group = (
-        pg_collection.tp
-        if pg_collection is not None
-        else parallel_state.get_tensor_model_parallel_group()
-    )
-    for opt in result_optimizer.chained_optimizers:
-        setattr(opt, 'tp_group', tp_group)
-    return result_optimizer
+    return ChainedOptimizer(optimizers)
