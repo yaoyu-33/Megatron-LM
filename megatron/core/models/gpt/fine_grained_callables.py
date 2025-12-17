@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import weakref
 from contextlib import nullcontext
@@ -8,6 +8,11 @@ from typing import Optional
 import torch
 
 from megatron.core import tensor_parallel
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_group_commit,
+    fine_grained_offloading_group_start,
+    get_fine_grained_offloading_context,
+)
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -16,6 +21,7 @@ from megatron.core.transformer.multi_token_prediction import (
     get_mtp_layer_offset,
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
+from megatron.core.utils import internal_api
 
 
 def weak_method(method):
@@ -35,13 +41,15 @@ def weak_method(method):
     return wrapped_func
 
 
-def should_free_input(name, is_moe, is_deepep):
+@internal_api
+def should_free_input(name, is_moe, enable_deepep, enable_hybridep):
     """Determine if the node should free its input memory.
 
     Args:
         name: Node name
         is_moe: Whether it's a MoE model
-        is_deepep: Whether it's a DeepEP model
+        enable_deepep: Whether to use DeepEP dispatcher
+        enable_hybridep: Whether to use HybridEP dispatcher
 
     Returns:
         bool: Whether to free input memory
@@ -55,12 +63,13 @@ def should_free_input(name, is_moe, is_deepep):
     # The input and output of A2A are not needed anymore after the forward pass,
     # so we can free the input memory after the forward pass.
     free_input_nodes = {
-        "mlp": True,
+        "mlp": not enable_hybridep,
         "moe_combine": True,
-        # For non-deepep mode, the input is the un-dispatched tokens and probs before dispatch A2A
-        # and it's not needed anymore after the forward pass
-        # For deepep mode, they are both needed in backward pass, so they cannot be freed.
-        "moe_dispatch": not is_deepep,
+        # For non-DeepEP and non-HybridEP dispatcher mode, the input is the un-dispatched tokens
+        # and probs before dispatch A2A and it's not needed anymore after the forward pass
+        # For DeepEP and HybridEP dispatcher mode, they are both needed in backward pass
+        # and cannot be freed.
+        "moe_dispatch": not (enable_deepep or enable_hybridep),
     }
 
     return free_input_nodes.get(name, False)
@@ -153,26 +162,19 @@ class PostProcessNode(ScheduleNode):
         """Implements the forward pass for postprocessing.
 
         This method handles:
-        1. Final layer normalization
-        2. Output layer computation
-        3. Loss computation if labels are provided
+        1. Output layer computation
+        2. Loss computation if labels are provided
 
         Args:
             hidden_states: The hidden states from the transformer layers.
 
         Returns:
             The logits or loss depending on whether labels are provided.
-        """
-        # Final layer norm from Decoder
-        if self.gpt_model.decoder.final_layernorm and not self.gpt_model.mtp_process:
-            hidden_states = self.gpt_model.decoder.final_layernorm(hidden_states)
-            # TENorm produces a "viewed" tensor. This will result in schedule.py's
-            # deallocate_output_tensor() throwing an error, so a viewless tensor is
-            # created to prevent this.
-            hidden_states = make_viewless_tensor(
-                inp=hidden_states, requires_grad=True, keep_graph=True
-            )
 
+        Note:
+            Final layernorm now has been moved from the post-process stage to the
+            last decoder layer, so we don't need to run the final layer norm here.
+        """
         # Run GPTModel._postprocess
         loss = self.gpt_model._postprocess(
             hidden_states=hidden_states,
@@ -225,12 +227,13 @@ class TransformerLayerNode(ScheduleNode):
             it's the per_batch_state_context, o.w. nullcontext
             name (str): Node name, also used to determine memory strategy
             bwd_dw_callables (list): List of weight gradient functions for the layer.
-            extra_args (dict): Extra arguments for the node: is_moe, enable_deepep.
+            extra_args (dict): Extra arguments for nodes: is_moe, enable_deepep, enable_hybridep.
         """
         # determine whether to free input memory
         is_moe = extra_args.get("is_moe", False)
         enable_deepep = extra_args.get("enable_deepep", False)
-        free_input = should_free_input(name, is_moe, enable_deepep)
+        enable_hybridep = extra_args.get("enable_hybridep", False)
+        free_input = should_free_input(name, is_moe, enable_deepep, enable_hybridep)
         self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
 
         super().__init__(
@@ -246,6 +249,7 @@ class TransformerLayerNode(ScheduleNode):
         self.submodule = submodule
         self.detached = tuple()
         self.before_detached = tuple()
+        self.is_mtp = extra_args.get("is_mtp", False)
 
         # Create flags to indicate first and last layer
         self.is_first_layer = extra_args.get("is_first_layer", False)
@@ -275,7 +279,13 @@ class TransformerLayerNode(ScheduleNode):
         detached_grad = tuple([e.grad for e in self.detached])
         grads = output_grad + detached_grad
         self.default_backward_func(outputs + self.before_detached, grads)
-        self._release_state()
+        # release the output grad memory after backward finishes,
+        # except when delay_wgrad_comptue is enabled, the grad should be
+        # kept until all modules' backward_dw has been invoked.
+        if self.delay_wgrad_compute:
+            self.output_grads = grads
+            self.delay_grads_release = len(self.bwd_dw_callables) > 0
+
         # return grads for record stream
         return grads
 
@@ -286,9 +296,16 @@ class TransformerLayerNode(ScheduleNode):
         with torch.cuda.nvtx.range(f"{self.name} wgrad"):
             for module in self.bwd_dw_callables:
                 module.backward_dw()
+
+        # the output grad memory is last used in wgrad compute, should be safe to release.
+        assert self.delay_grads_release, "output grad memory should be valid before wgrad."
+        for tensor in self.output_grads:
+            tensor.untyped_storage().resize_(0)
+        self.output_grads = None
+
         self.bwd_dw_callables = None
 
-    def _release_state(self):
+    def __del__(self):
         # Release reference as early as possible, this helps avoid memory leak.
         self.before_detached = None
         self.detached = None
@@ -329,6 +346,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         layer.config.moe_token_dispatcher_type == "flex"
         and layer.config.moe_flex_dispatcher_backend == "deepep"
     )
+    enable_hybridep = (
+        layer.config.moe_token_dispatcher_type == "flex"
+        and layer.config.moe_flex_dispatcher_backend == "hybridep"
+    )
 
     def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
@@ -350,15 +371,20 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Run forward pass for computations between attention and dispatch:
             pre mlp layernorm->router->dispatch preprocess
         """
+        if layer.offload_mlp_norm:
+            hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
         if layer.recompute_pre_mlp_layernorm:
             layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
-                layer.pre_mlp_layernorm, hidden_states
-            )
+            with get_fine_grained_offloading_context(layer.offload_mlp_norm):
+                pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
+                    layer.pre_mlp_layernorm, hidden_states
+                )
         else:
-            pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
+            with get_fine_grained_offloading_context(layer.offload_mlp_norm):
+                pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
 
-        local_tokens, probs, _ = layer.mlp.router_and_preprocess(pre_mlp_layernorm_output)
+        probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
+        local_tokens, probs, _ = layer.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
 
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
@@ -375,7 +401,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Dispatches tokens to the experts based on the router output.
         """
         token_dispatcher = layer.mlp.token_dispatcher
-        if enable_deepep:
+        if enable_deepep or enable_hybridep:
             # update token_probs to be the detached version, prevents
             # backward graph from connecting to attn submodule
             token_dispatcher._comm_manager.token_probs = probs
@@ -392,7 +418,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         shared_expert_output = None
         dispatched_probs = node.layer_state.dispatched_probs
         token_dispatcher = layer.mlp.token_dispatcher
-        if enable_deepep:
+        if enable_deepep or enable_hybridep:
             # update dispatched_probs to be detached version, prevents
             # backward graph from connecting to dispatch submodule
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
@@ -437,6 +463,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
                 mlp_output_with_bias, residual, layer.hidden_dropout
             )
+        if layer.offload_mlp_norm:
+            (hidden_states,) = fine_grained_offloading_group_commit(
+                hidden_states, name="mlp_norm", forced_released_tensors=[residual]
+            )
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
@@ -446,6 +476,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
         # release tensor reference after use
         node.layer_state.residual = None
+
+        # final layer norm from decoder
+        final_layernorm = node.chunk_state.model.decoder.final_layernorm
+        if not node.is_mtp and final_layernorm and node.is_last_layer:
+            output = final_layernorm(output)
+            output = make_viewless_tensor(inp=output, requires_grad=True, keep_graph=True)
         return output
 
     def mlp_wrapper(node: ScheduleNode, *args, **kwargs):
@@ -485,15 +521,7 @@ def build_mtp_layer_callables(layer):
     def submodule_mtp_attn_forward(node, hidden_states):
         # MTP Block Preprocess
         if node.is_first_layer:
-            # Final layer norm from Decoder
-            final_layernorm = node.chunk_state.model.decoder.final_layernorm
-            if final_layernorm:
-                hidden_states = final_layernorm(hidden_states)
-                hidden_states = make_viewless_tensor(
-                    inp=hidden_states, requires_grad=True, keep_graph=True
-                )
-                hidden_states = node.detach(hidden_states)
-            offset = get_mtp_layer_offset(layer.config)
+            offset = get_mtp_layer_offset(layer.config, node.chunk_state.model.vp_stage)
             node.chunk_state.mtp_hidden_states = list(torch.chunk(hidden_states, 1 + offset, dim=0))
             hidden_states = node.chunk_state.mtp_hidden_states[offset]
 
