@@ -294,11 +294,15 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
         tokens_per_expert = self.local_map.sum(dim=0).long().cpu()
 
+        # When no tokens are routed to local experts, TE's fused_permute creates
+        # autograd nodes whose backward expects a matching fused_unpermute.
+        # Fall back to unfused permute so the indices format and autograd graph
+        # stay consistent with the unfused unpermute in combine_preprocess.
+        self._empty_local_dispatch = tokens_per_expert.sum().item() == 0
+        use_fused = self.config.moe_permute_fusion and not self._empty_local_dispatch
+
         (permuted_local_hidden_states, _, self.reversed_local_input_permutation_mapping) = permute(
-            hidden_states,
-            self.local_map,
-            num_out_tokens=tokens_per_expert.sum(),
-            fused=self.config.moe_permute_fusion,
+            hidden_states, self.local_map, num_out_tokens=tokens_per_expert.sum(), fused=use_fused
         )
 
         self.local_probs = self.local_probs.T.contiguous().masked_select(
@@ -316,13 +320,22 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         original sequence positions, preparing them for the subsequent reduction scatter
         operation that will aggregate results across ranks.
         """
+        use_fused = self.config.moe_permute_fusion and not self._empty_local_dispatch
+
         unpermuted_local_hidden = unpermute(
             hidden_states,
             self.reversed_local_input_permutation_mapping,
             restore_shape=self.hidden_shape_before_permute,
             routing_map=self.local_map,
-            fused=self.config.moe_permute_fusion,
+            fused=use_fused,
         )
+
+        # When an EP rank receives zero tokens, unfused unpermute returns a zero-filled
+        # tensor disconnected from the autograd graph. The no-op addition reconnects it
+        # so backward-pass collectives (AllGather in ReduceScatter backward) run on all ranks.
+        if self._empty_local_dispatch and hidden_states.requires_grad:
+            unpermuted_local_hidden = unpermuted_local_hidden + hidden_states.sum() * 0
+
         return unpermuted_local_hidden
 
     def token_combine(self, hidden_states):
@@ -342,6 +355,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
     def combine_postprocess(self, hidden_states):
         """Restores the original tensor shape."""
+        if hidden_states.numel() == 0:
+            return torch.zeros(
+                self.hidden_shape, dtype=hidden_states.dtype, device=hidden_states.device
+            )
         return hidden_states.view(self.hidden_shape)
 
 
@@ -830,17 +847,22 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.post_forward_comm()
 
         # Unpermutation 1: AlltoAll output to output
-        output = unpermute(
-            permutated_local_input_tokens,
-            self.reversed_local_input_permutation_mapping,
-            restore_shape=self.hidden_shape_before_permute,
-            routing_map=self.routing_map,
-            fused=self.config.moe_permute_fusion,
-            drop_and_pad=self.drop_and_pad,
-        )
-
-        # Reshape the output tensor
-        output = output.view(self.hidden_shape)
+        if permutated_local_input_tokens.numel() == 0:
+            output = torch.zeros(
+                self.hidden_shape,
+                dtype=permutated_local_input_tokens.dtype,
+                device=permutated_local_input_tokens.device,
+            )
+        else:
+            output = unpermute(
+                permutated_local_input_tokens,
+                self.reversed_local_input_permutation_mapping,
+                restore_shape=self.hidden_shape_before_permute,
+                routing_map=self.routing_map,
+                fused=self.config.moe_permute_fusion,
+                drop_and_pad=self.drop_and_pad,
+            )
+            output = output.view(self.hidden_shape)
 
         # Add shared experts output
         if self.shared_experts is not None:
@@ -1517,4 +1539,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             The final MoE layer output reshaped to its original dimensions.
         """
+        if hidden_states.numel() == 0:
+            return torch.zeros(
+                self.hidden_shape, dtype=hidden_states.dtype, device=hidden_states.device
+            )
         return hidden_states.view(self.hidden_shape)
