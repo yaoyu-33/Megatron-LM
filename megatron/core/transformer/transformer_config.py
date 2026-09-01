@@ -1498,9 +1498,9 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "attention_cp_layout='contiguous' is not yet supported with context parallelism."
             )
-        if self.linear_cp_layout == "contiguous" and self.hybrid_context_parallel:
+        if self.linear_cp_layout == "contiguous" and self.dynamic_context_parallel:
             raise ValueError(
-                "hybrid_context_parallel is not supported with linear_cp_layout='contiguous'."
+                "dynamic_context_parallel is not supported with linear_cp_layout='contiguous'."
             )
         if (
             self.sequence_packing_scheduler is not None
