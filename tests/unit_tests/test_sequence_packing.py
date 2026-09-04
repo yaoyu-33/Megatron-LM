@@ -93,6 +93,22 @@ def test_dynamic_cp_group_sizes_partition_dpxcp_ranks():
     assert parallel_state.get_valid_dynamic_context_parallel_group_sizes(6) == [1, 2, 6]
 
 
+def test_dynamic_cp_full_group_does_not_depend_on_gtp_remat_group(monkeypatch):
+    dp_cp_group = object()
+    monkeypatch.setattr(parallel_state, "_DATA_PARALLEL_GROUP_WITH_CP", dp_cp_group)
+
+    def get_data_parallel_world_size(*, with_context_parallel, with_gtp_remat):
+        assert with_context_parallel
+        assert not with_gtp_remat
+        return 8
+
+    monkeypatch.setattr(
+        parallel_state, "get_data_parallel_world_size", get_data_parallel_world_size
+    )
+
+    assert parallel_state.get_dynamic_data_context_parallel_groups(group_size=8) is dp_cp_group
+
+
 def test_default_dynamic_cp_scheduler_rejects_uncreated_min_group_size():
     with pytest.raises(ValueError, match="min_cp_size=3.*expected one of"):
         DefaultDynamicCPScheduler(
