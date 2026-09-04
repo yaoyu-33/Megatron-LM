@@ -23,7 +23,6 @@ _REROUTE_KEY_ORDER = (
     "padded_seq_len",
 )
 _REROUTE_KEY_SET = frozenset(_REROUTE_KEY_ORDER)
-_REROUTE_SCALAR_KEYS = frozenset(("original_seq_len", "padded_seq_len"))
 
 
 def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
@@ -123,9 +122,13 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
     return batch_unpacked
 
 
-def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
+def gather_global_sequence_lengths(subsample_seqlens: torch.Tensor, dp_group):
     """
     Gathers the sequence lengths of all subsamples from all DP ranks and calculates global IDs.
+
+    This is the framework-facing metadata API for dynamic context parallelism. It does not
+    fetch, unpack, or otherwise interpret a training batch, so callers that own their data
+    contract can use the MCore scheduler without adopting MCore's GPT/SFT materialization.
     """
     # Collect the number of subsamples from all ranks
     num_local_subsamples = subsample_seqlens.shape[0]
@@ -177,6 +180,11 @@ def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
     global_ids_this_rank = global_ids[start_idx:end_idx]
 
     return global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered
+
+
+def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
+    """Backward-compatible alias for :func:`gather_global_sequence_lengths`."""
+    return gather_global_sequence_lengths(subsample_seqlens, dp_group)
 
 
 def _pack_sequences(
@@ -445,11 +453,11 @@ def create_data_iterator(new_samples, pp_group, tp_group, config, is_dynamic_cp:
     return new_data_iterator
 
 
-def reroute_samples_to_dcp_ranks(
-    batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets, dp_group, dp_cp_group
+def reroute_tensor_fields_to_dcp_ranks(
+    batch, fields, global_ids_this_rank, sample_id_groups, offsets, dp_group, dp_cp_group
 ):
     """
-    Reroutes the sub-samples to the correct rank after scheduling.
+    Reroute caller-selected tensor fields after dynamic-CP placement.
 
     Each CP lane gathers the samples from its DP group, then keeps only the
     samples assigned to its DPxCP rank. Gathering within ``dp_group`` avoids
@@ -460,28 +468,31 @@ def reroute_samples_to_dcp_ranks(
     one global field. Selected slices are cloned before the next key so the
     full gather buffer can be released.
 
-    This is intentionally a text-only contract. Multimodal fields are rejected
-    until their per-token, per-sample, or per-media routing layout is defined.
+    MCore treats each field as an opaque flattened tensor. The caller owns the
+    field schema, shape reconstruction, padding values, and final THD local-batch
+    materialization. Per-sample element counts for all fields are gathered in one
+    metadata collective, so fields do not need to have sequence-length-shaped
+    payloads.
     """
-
     dcp_rank = dp_cp_group.rank()
     dp_rank = dp_group.rank()
     dp_size = dp_group.size()
 
-    batch_keys = set(batch[0])
-    unsupported_keys = batch_keys - _REROUTE_KEY_SET
-    assert not unsupported_keys, (
-        "Dynamic CP reroute currently supports only the text sample schema; "
-        f"cannot reroute unsupported sample keys {sorted(unsupported_keys)}. "
-        "extend _REROUTE_KEY_ORDER and classify their element layout."
-    )
-    for sample_idx, sample in enumerate(batch[1:], start=1):
-        sample_keys = set(sample)
-        assert sample_keys == batch_keys, (
-            f"Sample {sample_idx} keys {sorted(sample_keys)} do not match sample 0 keys "
-            f"{sorted(batch_keys)}."
+    fields = tuple(fields)
+    assert fields, "Dynamic CP reroute requires at least one tensor field."
+    assert len(fields) == len(set(fields)), f"Dynamic CP reroute fields must be unique: {fields}."
+    for sample_idx, sample in enumerate(batch):
+        missing_fields = set(fields) - set(sample)
+        assert (
+            not missing_fields
+        ), f"Sample {sample_idx} is missing Dynamic CP reroute fields {sorted(missing_fields)}."
+        non_tensor_fields = [
+            field for field in fields if not isinstance(sample[field], torch.Tensor)
+        ]
+        assert not non_tensor_fields, (
+            f"Sample {sample_idx} has non-tensor Dynamic CP reroute fields "
+            f"{sorted(non_tensor_fields)}."
         )
-    data_keys = [key for key in _REROUTE_KEY_ORDER if key in batch_keys]
 
     offset_values = [int(value) for value in offsets.tolist()]
     assert (
@@ -499,33 +510,56 @@ def reroute_samples_to_dcp_ranks(
     recv_ids = sorted(
         {gid for sample_id_group in sample_id_groups for gid in sample_id_group[dcp_rank]}
     )
-    recv_samples = {gid: {key: None for key in data_keys} for gid in recv_ids}
-    seq_len_by_gid = dict(global_id_seqlens)
+    recv_samples = {gid: {field: None for field in fields} for gid in recv_ids}
 
-    def _build_layout(is_scalar):
-        sample_numels = {
-            gid: 1 if is_scalar else int(seq_len_by_gid[gid]) for gid in range(offset_values[-1])
-        }
+    num_fields = len(fields)
+    max_local_samples = max(
+        offset_values[rank + 1] - offset_values[rank] for rank in range(dp_size)
+    )
+    dev = torch.cuda.current_device()
+    local_numels = torch.zeros((max_local_samples, num_fields), dtype=torch.int64, device=dev)
+    if batch:
+        local_numels[: len(batch)] = torch.tensor(
+            [[sample[field].numel() for field in fields] for sample in batch],
+            dtype=torch.int64,
+            device=dev,
+        )
+    if dp_size == 1:
+        gathered_numels = local_numels
+    else:
+        gathered_numels = torch.empty(
+            (dp_size * max_local_samples, num_fields), dtype=torch.int64, device=dev
+        )
+        torch.distributed.all_gather_into_tensor(gathered_numels, local_numels, group=dp_group)
+
+    global_numels = {field: {} for field in fields}
+    for source_rank in range(dp_size):
+        rank_sample_count = offset_values[source_rank + 1] - offset_values[source_rank]
+        rank_numels = gathered_numels[
+            source_rank * max_local_samples : source_rank * max_local_samples + rank_sample_count
+        ]
+        for local_idx, gid in enumerate(
+            range(offset_values[source_rank], offset_values[source_rank + 1])
+        ):
+            for field_idx, field in enumerate(fields):
+                global_numels[field][gid] = int(rank_numels[local_idx, field_idx].item())
+
+    for key in fields:
         rank_numels = [
-            sum(sample_numels[gid] for gid in range(offset_values[rank], offset_values[rank + 1]))
+            sum(
+                global_numels[key][gid]
+                for gid in range(offset_values[rank], offset_values[rank + 1])
+            )
             for rank in range(dp_size)
         ]
         max_rank_numel = max(rank_numels)
-
         sample_slices = {}
         for source_rank in range(dp_size):
             cursor = source_rank * max_rank_numel
             for gid in range(offset_values[source_rank], offset_values[source_rank + 1]):
-                sample_numel = sample_numels[gid]
+                sample_numel = global_numels[key][gid]
                 sample_slices[gid] = (cursor, sample_numel)
                 cursor += sample_numel
-
-        return rank_numels, max_rank_numel, sample_slices
-
-    layouts = {False: _build_layout(is_scalar=False), True: _build_layout(is_scalar=True)}
-
-    for key in data_keys:
-        rank_numels, max_rank_numel, sample_slices = layouts[key in _REROUTE_SCALAR_KEYS]
 
         local_tensor = torch.cat(
             [
@@ -555,6 +589,35 @@ def reroute_samples_to_dcp_ranks(
             recv_samples[gid][key] = gathered_tensor[start : start + sample_numel].clone()
 
     return recv_samples
+
+
+def reroute_samples_to_dcp_ranks(
+    batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets, dp_group, dp_cp_group
+):
+    """Reroute the legacy text-only GPT/SFT schema after dynamic-CP placement."""
+    batch_keys = set(batch[0])
+    unsupported_keys = batch_keys - _REROUTE_KEY_SET
+    assert not unsupported_keys, (
+        "Dynamic CP reroute currently supports only the text sample schema; "
+        f"cannot reroute unsupported sample keys {sorted(unsupported_keys)}. "
+        "Use reroute_tensor_fields_to_dcp_ranks with a framework-owned field schema."
+    )
+    for sample_idx, sample in enumerate(batch[1:], start=1):
+        sample_keys = set(sample)
+        assert sample_keys == batch_keys, (
+            f"Sample {sample_idx} keys {sorted(sample_keys)} do not match sample 0 keys "
+            f"{sorted(batch_keys)}."
+        )
+    fields = [key for key in _REROUTE_KEY_ORDER if key in batch_keys]
+    return reroute_tensor_fields_to_dcp_ranks(
+        batch=batch,
+        fields=fields,
+        global_ids_this_rank=global_ids_this_rank,
+        sample_id_groups=sample_id_groups,
+        offsets=offsets,
+        dp_group=dp_group,
+        dp_cp_group=dp_cp_group,
+    )
 
 
 def build_packed_microbatches(

@@ -18,6 +18,7 @@ from megatron.core.datasets.data_schedule import (
 from megatron.core.datasets.data_schedule_utils import (
     next_hdp_group_packing_aware,
     reroute_samples_to_dcp_ranks,
+    reroute_tensor_fields_to_dcp_ranks,
 )
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
@@ -149,6 +150,10 @@ def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
 
     def _all_gather_into_tensor(output, input_, group):
         gather_groups.append(group)
+        if input_.ndim == 2:
+            remote = torch.tensor([[4, 4, 4, 4, 1, 1], [0, 0, 0, 0, 0, 0]])
+            output.copy_(torch.cat([input_, remote]))
+            return
         remote = next(remote_inputs)
         assert input_.numel() == remote.numel()
         output.copy_(torch.cat([input_, remote]))
@@ -178,7 +183,42 @@ def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
     assert torch.equal(received[2]['position_ids'], torch.tensor([0, 1, 2, 3]))
     assert received[2]['original_seq_len'].item() == 4
     assert received[2]['padded_seq_len'].item() == 4
-    assert gather_groups == [dp_group] * 6
+    assert gather_groups == [dp_group] * 7
+
+
+def test_generic_scheduler_reroute_transports_caller_selected_tensor_fields(monkeypatch):
+    group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    batch = [
+        {
+            'tokens': torch.tensor([10, 11]),
+            'advantages': torch.tensor([0.25]),
+            'image_grid_thw': torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            'framework_metadata': 'not transported',
+        },
+        {
+            'tokens': torch.tensor([20]),
+            'advantages': torch.tensor([0.5, 0.75]),
+            'image_grid_thw': torch.tensor([[7, 8, 9]]),
+            'framework_metadata': 'not transported',
+        },
+    ]
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+
+    received = reroute_tensor_fields_to_dcp_ranks(
+        batch=batch,
+        fields=('tokens', 'advantages', 'image_grid_thw'),
+        global_ids_this_rank=torch.tensor([0, 1]),
+        sample_id_groups=[[[0, 1]]],
+        offsets=torch.tensor([0, 2]),
+        dp_group=group,
+        dp_cp_group=group,
+    )
+
+    assert list(received) == [0, 1]
+    assert torch.equal(received[0]['tokens'], torch.tensor([10, 11]))
+    assert torch.equal(received[1]['advantages'], torch.tensor([0.5, 0.75]))
+    assert torch.equal(received[0]['image_grid_thw'], torch.tensor([1, 2, 3, 4, 5, 6]))
+    assert 'framework_metadata' not in received[0]
 
 
 def test_scheduler_reroute_rejects_multimodal_metadata_in_text_contract():
