@@ -11,9 +11,9 @@ from megatron.core.rerun_state_machine import RerunDataIterator
 
 _DYNAMIC_CP_WORKLOAD_CAP_DELTA = 0.05
 
-# Dynamic CP rerouting currently owns the text-only GPT/SFT sample schema.
-# Multimodal metadata needs explicit element-layout and routing semantics
-# before it can be added here.
+# The legacy wrapper below owns the text-only GPT/SFT sample schema. New
+# framework integrations should call ``reroute_tensor_fields_to_dcp_ranks``
+# and keep their field layout/materialization policy outside MCore.
 _REROUTE_KEY_ORDER = (
     "tokens",
     "labels",
@@ -532,10 +532,14 @@ def reroute_tensor_fields_to_dcp_ranks(
         )
         torch.distributed.all_gather_into_tensor(gathered_numels, local_numels, group=dp_group)
 
+    # Parse the complete metadata matrix on the host after one device transfer.
+    # Calling ``item()`` for every sample/field would serialize hundreds of
+    # device synchronizations for large logical batches.
+    gathered_numels_cpu = gathered_numels.cpu()
     global_numels = {field: {} for field in fields}
     for source_rank in range(dp_size):
         rank_sample_count = offset_values[source_rank + 1] - offset_values[source_rank]
-        rank_numels = gathered_numels[
+        rank_numels = gathered_numels_cpu[
             source_rank * max_local_samples : source_rank * max_local_samples + rank_sample_count
         ]
         for local_idx, gid in enumerate(
