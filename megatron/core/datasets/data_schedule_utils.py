@@ -937,7 +937,10 @@ def next_hdp_group_packing_aware(
             group_start_rank = members[0]
             group_end_rank = members[-1]
             empty_rank = empty_ranks[0]
-            if group_end_rank + 1 > empty_rank or group_end_rank + needed_count >= total_gpus:
+            # Expanding this group shifts every occupied rank between the group
+            # and the first empty rank to the right.  The shifted suffix, rather
+            # than only the enlarged group, must still fit in the rank array.
+            if group_end_rank + 1 > empty_rank or empty_rank + needed_count > total_gpus:
                 continue
 
             work_to_push = micro_batches[group_end_rank + 1 : empty_rank]
