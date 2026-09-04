@@ -221,6 +221,34 @@ def test_generic_scheduler_reroute_transports_caller_selected_tensor_fields(monk
     assert 'framework_metadata' not in received[0]
 
 
+def test_generic_scheduler_reroute_dp1_only_moves_locally_selected_samples(monkeypatch):
+    group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    batch = [
+        {'tokens': torch.tensor([10, 11]), 'labels': torch.tensor([110, 111])},
+        {'tokens': torch.tensor([20]), 'labels': torch.tensor([120])},
+    ]
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    monkeypatch.setattr(
+        torch.distributed,
+        'all_gather_into_tensor',
+        lambda *args, **kwargs: pytest.fail('DP=1 reroute must not issue collectives'),
+    )
+
+    received = reroute_tensor_fields_to_dcp_ranks(
+        batch=batch,
+        fields=('tokens', 'labels'),
+        global_ids_this_rank=torch.tensor([0, 1]),
+        sample_id_groups=[[[1]]],
+        offsets=torch.tensor([0, 2]),
+        dp_group=group,
+        dp_cp_group=group,
+    )
+
+    assert list(received) == [1]
+    assert torch.equal(received[1]['tokens'], torch.tensor([20]))
+    assert torch.equal(received[1]['labels'], torch.tensor([120]))
+
+
 def test_scheduler_reroute_rejects_multimodal_metadata_in_text_contract():
     group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
     batch = [

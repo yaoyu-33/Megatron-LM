@@ -510,6 +510,24 @@ def reroute_tensor_fields_to_dcp_ranks(
     recv_ids = sorted(
         {gid for sample_id_group in sample_id_groups for gid in sample_id_group[dcp_rank]}
     )
+
+    # The common long-context topology uses the full DPxCP pool as dynamic CP
+    # with static DP=1. Every CP sibling already has the same framework batch,
+    # so transfer only this rank's selected samples instead of staging the
+    # entire logical global batch on every GPU.
+    if dp_size == 1:
+        first_gid = offset_values[0]
+        return {
+            gid: {
+                field: batch[gid - first_gid][field]
+                .to(torch.cuda.current_device(), non_blocking=True)
+                .reshape(-1)
+                .contiguous()
+                for field in fields
+            }
+            for gid in recv_ids
+        }
+
     recv_samples = {gid: {field: None for field in fields} for gid in recv_ids}
 
     num_fields = len(fields)
@@ -524,13 +542,10 @@ def reroute_tensor_fields_to_dcp_ranks(
             dtype=torch.int64,
             device=dev,
         )
-    if dp_size == 1:
-        gathered_numels = local_numels
-    else:
-        gathered_numels = torch.empty(
-            (dp_size * max_local_samples, num_fields), dtype=torch.int64, device=dev
-        )
-        torch.distributed.all_gather_into_tensor(gathered_numels, local_numels, group=dp_group)
+    gathered_numels = torch.empty(
+        (dp_size * max_local_samples, num_fields), dtype=torch.int64, device=dev
+    )
+    torch.distributed.all_gather_into_tensor(gathered_numels, local_numels, group=dp_group)
 
     # Parse the complete metadata matrix on the host after one device transfer.
     # Calling ``item()`` for every sample/field would serialize hundreds of
@@ -582,11 +597,8 @@ def reroute_tensor_fields_to_dcp_ranks(
         else:
             gather_input = local_tensor.contiguous()
 
-        if dp_size == 1:
-            gathered_tensor = gather_input
-        else:
-            gathered_tensor = local_tensor.new_empty(dp_size * max_rank_numel)
-            torch.distributed.all_gather_into_tensor(gathered_tensor, gather_input, group=dp_group)
+        gathered_tensor = local_tensor.new_empty(dp_size * max_rank_numel)
+        torch.distributed.all_gather_into_tensor(gathered_tensor, gather_input, group=dp_group)
 
         for gid in recv_ids:
             start, sample_numel = sample_slices[gid]
